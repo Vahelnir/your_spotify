@@ -106,8 +106,8 @@ export class PrivacyImporter implements HistoryImporter<"privacy"> {
         durationMs: item.track.duration_ms,
       });
     }
-    await setImporterStateCurrent(this.id, this.currentItem + 1);
     await addTrackIdsToUser(this.userId.toString(), finalInfos);
+    await setImporterStateCurrent(this.id, this.currentItem + 1);
     const min = minOfArray(finalInfos, (info) => info.played_at.getTime());
     if (min) {
       const minInfo = finalInfos[min.minIndex];

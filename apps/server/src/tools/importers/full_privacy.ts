@@ -7,9 +7,13 @@ import {
   getCloseTrackId,
   storeFirstListenedAtIfLess,
 } from "../../database";
+import { TrackModel } from "../../database/Models";
 import { setImporterStateCurrent } from "../../database/queries/importer";
 import { Infos } from "../../database/schemas/info";
-import { RecentlyPlayedTrack } from "../../database/schemas/track";
+import {
+  RecentlyPlayedTrack,
+  SpotifyTrack,
+} from "../../database/schemas/track";
 import { User } from "../../database/schemas/user";
 import {
   getTracksAlbumsArtists,
@@ -56,17 +60,38 @@ export class FullPrivacyImporter implements HistoryImporter<"full-privacy"> {
 
   static idFromSpotifyURI = (uri: string) => uri.split(":")[2];
 
-  search = async (spotifyIds: string[]) => {
-    if (spotifyIds.length === 0) {
-      return [];
+  getTrackFromDb = async (id: string) => {
+    const track = await TrackModel.findOne({ id }, { _id: 0, __v: 0 }).lean();
+    if (!track) {
+      return undefined;
     }
-    const res = await retryPromise(
-      () => this.spotifyApi.getTracks(spotifyIds),
-      10,
-      30,
-      isTransientError,
+    return {
+      ...track,
+      album: { id: track.album },
+      artists: track.artists.map((artistId) => ({ id: artistId })),
+    } as unknown as SpotifyTrack;
+  };
+
+  getTrack = async (id: string) => {
+    const userId = this.userId.toString();
+    const cached = getFromCacheString(userId, id);
+    if (cached) {
+      return cached.exists ? cached.track : undefined;
+    }
+    const track =
+      (await this.getTrackFromDb(id)) ??
+      (await retryPromise(
+        () => this.spotifyApi.getTrack(id),
+        3,
+        30,
+        isTransientError,
+      ));
+    setToCacheString(
+      userId,
+      id,
+      track ? { exists: true, track } : { exists: false },
     );
-    return res;
+    return track;
   };
 
   storeItems = async (userId: string, items: RecentlyPlayedTrack[]) => {
@@ -107,8 +132,8 @@ export class FullPrivacyImporter implements HistoryImporter<"full-privacy"> {
         durationMs: item.track.duration_ms,
       });
     }
-    await setImporterStateCurrent(this.id, this.currentItem + 1);
     await addTrackIdsToUser(this.userId.toString(), finalInfos);
+    await setImporterStateCurrent(this.id, this.currentItem + 1);
     const min = minOfArray(finalInfos, (info) => info.played_at.getTime());
     if (min) {
       const minInfo = finalInfos[min.minIndex];
@@ -163,50 +188,9 @@ export class FullPrivacyImporter implements HistoryImporter<"full-privacy"> {
     return null;
   };
 
-  checkIdsToSearch = async (
-    idsToSearch: Record<string, string[]>,
-    items: RecentlyPlayedTrack[],
-    force = false,
-  ) => {
-    const ids = Object.keys(idsToSearch);
-    if (ids.length < 45 && !force) {
-      return idsToSearch;
-    }
-    const searchedItems = await this.search(ids);
-    for (const [index, searchedItem] of searchedItems.entries()) {
-      const id = ids[index];
-      if (!id) {
-        continue;
-      }
-      if (searchedItem === undefined) {
-        setToCacheString(this.userId.toString(), id, { exists: false });
-        continue;
-      }
-      const playedAt = idsToSearch[searchedItem.id];
-      if (!playedAt) {
-        logger.error("Cannot add item", searchedItem.id, "no played_at found");
-        continue;
-      }
-      setToCacheString(this.userId.toString(), searchedItem.id, {
-        exists: true,
-        track: searchedItem,
-      });
-      playedAt.forEach((pa) => {
-        items.push({ track: searchedItem, played_at: pa });
-      });
-      logger.info(
-        `Adding ${searchedItem.name} - ${searchedItem.artists[0]?.name} from data`,
-      );
-    }
-    idsToSearch = {};
-    return idsToSearch;
-  };
-
   run = async (id: string) => {
     this.id = id;
     let items: RecentlyPlayedTrack[] = [];
-    // Id of song to played_at
-    let idsToSearch: Record<string, string[]> = {};
     if (!this.elements) {
       return false;
     }
@@ -224,12 +208,16 @@ export class FullPrivacyImporter implements HistoryImporter<"full-privacy"> {
       if (content.ms_played < 30 * 1000) {
         // If track was played for less than 30 seconds
         logger.info(
-          `Track ${content.master_metadata_track_name} - ${content.master_metadata_album_artist_name
+          `Track ${content.master_metadata_track_name} - ${
+            content.master_metadata_album_artist_name
           } was passed, only listened for ${Math.floor(
             content.ms_played / 1000,
           )} seconds`,
         );
         continue;
+      }
+      if (!content.spotify_track_uri.startsWith("spotify:track:")) {
+        logger.debug(`Not a track uri: ${content.spotify_track_uri}`);
       }
       const spotifyId = FullPrivacyImporter.idFromSpotifyURI(
         content.spotify_track_uri,
@@ -240,21 +228,15 @@ export class FullPrivacyImporter implements HistoryImporter<"full-privacy"> {
         );
         continue;
       }
-      const item = getFromCacheString(this.userId.toString(), spotifyId);
-      if (!item) {
-        const arrayOfPlayedAt = idsToSearch[spotifyId] ?? [];
-        arrayOfPlayedAt.push(content.ts);
-        idsToSearch[spotifyId] = arrayOfPlayedAt;
-        idsToSearch = await this.checkIdsToSearch(idsToSearch, items);
-      } else if (item.exists) {
-        items.push({ track: item.track, played_at: content.ts });
+      const track = await this.getTrack(spotifyId);
+      if (track) {
+        items.push({ track, played_at: content.ts });
       }
       if (items.length >= 20) {
         await this.storeItems(this.userId, items);
         items = [];
       }
     }
-    await this.checkIdsToSearch(idsToSearch, items, true);
     if (items.length > 0) {
       await this.storeItems(this.userId, items);
       items = [];
