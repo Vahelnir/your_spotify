@@ -6,7 +6,7 @@ import {
   storeFirstListenedAtIfLess,
 } from "../database";
 import { TrackModel, AlbumModel, ArtistModel } from "../database/Models";
-import { Album } from "../database/schemas/album";
+import { Album, SpotifyAlbum } from "../database/schemas/album";
 import { Artist } from "../database/schemas/artist";
 import { Infos } from "../database/schemas/info";
 import { SpotifyTrack, Track } from "../database/schemas/track";
@@ -38,20 +38,28 @@ export const getTracks = async (userId: string, ids: string[]) => {
   return toTracks(userId, compact(await client.getTracks(ids)));
 };
 
-export const getAlbums = async (userId: string, ids: string[]) => {
-  const client = new SpotifyAPI(userId);
-  const spotifyAlbums = compact(await client.getAlbums(ids));
-
-  const albums: Album[] = spotifyAlbums.map((alb) => {
+// Albums embedded in a track have no genres nor copyrights
+const toAlbums = (userId: string, spotifyAlbums: SpotifyAlbum[]) => {
+  const albums = spotifyAlbums.map<Album>((alb) => {
     logger.info(
       `Storing non existing album ${alb.name} by ${alb.artists[0]?.name}`,
     );
 
-    return { ...alb, artists: alb.artists.map((art) => art.id) };
+    return {
+      ...alb,
+      artists: alb.artists.map((art) => art.id),
+      genres: alb.genres ?? [],
+      copyrights: alb.copyrights ?? [],
+    };
   });
   Metrics.ingestedAlbumsTotal.inc({ user: userId }, albums.length);
 
   return albums;
+};
+
+export const getAlbums = async (userId: string, ids: string[]) => {
+  const client = new SpotifyAPI(userId);
+  return toAlbums(userId, compact(await client.getAlbums(ids)));
 };
 
 export const getArtists = async (userId: string, ids: string[]) => {
@@ -108,8 +116,23 @@ export const getTracksAlbumsArtists = async (
       !storedArtists.find((salb) => salb.id.toString() === alb.toString()),
   );
 
-  const albums =
-    missingAlbumIds.length > 0 ? await getAlbums(userId, missingAlbumIds) : [];
+  // A track read from the database only has an album id: fetch those albums
+  const missingAlbums = uniqBy(
+    missingTracks
+      .map((track) => track.album)
+      .filter((alb) => missingAlbumIds.includes(alb.id)),
+    (alb) => alb.id,
+  );
+  const fetchedAlbumIds = missingAlbums
+    .filter((alb) => !alb.name)
+    .map((alb) => alb.id);
+  const albums = toAlbums(
+    userId,
+    missingAlbums.filter((alb) => alb.name),
+  );
+  if (fetchedAlbumIds.length > 0) {
+    albums.push(...(await getAlbums(userId, fetchedAlbumIds)));
+  }
   const artists =
     missingArtistIds.length > 0
       ? await getArtists(userId, missingArtistIds)
