@@ -1,3 +1,5 @@
+import { logger } from "../logger";
+
 export type RequestPriority = "normal" | "high";
 
 interface HttpClientRequestConfig {
@@ -20,13 +22,13 @@ interface QueueItem<T = any> {
   config: HttpClientRequestConfig;
   resolve: (value: HttpClientResponse<T>) => void;
   reject: (reason?: unknown) => void;
-  retry429AttemptCount: number;
 }
 
 interface QueueState {
   highPriorityQueue: QueueItem<any>[];
   normalPriorityQueue: QueueItem<any>[];
   isProcessingQueue: boolean;
+  blockedUntil?: Date;
 }
 
 export class HttpError extends Error {
@@ -44,8 +46,22 @@ export class HttpError extends Error {
   }
 }
 
+export class RateLimitedError extends HttpError {
+  constructor(public readonly until: Date) {
+    super({
+      status: 429,
+      statusText: "Too Many Requests",
+      body: `Rate limited until ${until.toISOString()}`,
+    });
+  }
+}
+
+export const isTransientError = (error: unknown) =>
+  !(error instanceof HttpError && error.status < 500);
+
 const DEFAULT_RETRY_429_MAX_ATTEMPTS = 5;
 const DEFAULT_RETRY_AFTER_MS = 1000;
+const MAX_RETRY_429_WAIT_MS = 60_000;
 
 function createQueueState(): QueueState {
   return {
@@ -96,7 +112,6 @@ export class QueuedHttpClient {
         },
         resolve,
         reject,
-        retry429AttemptCount: 0,
       };
 
       this.enqueue(queueItem);
@@ -173,51 +188,60 @@ export class QueuedHttpClient {
       credentials: "include",
     };
 
-    const response = await fetch(url, payload);
+    // Only calls to the factory's API are rate limited, not the auth domain
+    const isApiCall = queueItem.config.url.startsWith(this.baseURL);
+    const maxAttempts =
+      queueItem.config.retry429MaxAttempts ?? DEFAULT_RETRY_429_MAX_ATTEMPTS;
+    let attemptCount = 0;
+    let waitedMs = 0;
 
-    if (!response.ok) {
+    while (true) {
+      const { blockedUntil } = this.queueState;
+      if (isApiCall && blockedUntil && blockedUntil.getTime() > Date.now()) {
+        throw new RateLimitedError(blockedUntil);
+      }
+
+      const response = await fetch(url, payload);
+
+      if (response.ok) {
+        const data = await response.json();
+        queueItem.resolve({
+          data,
+          status: response.status,
+          statusText: response.statusText,
+        });
+        return;
+      }
+
       const text = await response.text();
+      const httpError = new HttpError({
+        status: response.status,
+        statusText: response.statusText,
+        body: text,
+      });
 
       if (response.status !== 429) {
-        throw new HttpError({
-          status: response.status,
-          statusText: response.statusText,
-          body: text,
-        });
+        throw httpError;
       }
-
-      const maxAttempts =
-        queueItem.config.retry429MaxAttempts ?? DEFAULT_RETRY_429_MAX_ATTEMPTS;
-
-      if (queueItem.retry429AttemptCount >= maxAttempts) {
-        throw new HttpError({
-          status: response.status,
-          statusText: response.statusText,
-          body: text,
-        });
-      }
-
-      queueItem.retry429AttemptCount += 1;
-      this.requeue(queueItem);
 
       const retryAfterMs = this.parseRetryAfterHeader(response);
+      const until = new Date(Date.now() + retryAfterMs);
+      logger.warn(
+        `Rate limited on ${url.origin}, Retry-After: ${retryAfterMs / 1000}s, until ${until.toISOString()}`,
+      );
+
+      waitedMs += retryAfterMs;
+      if (attemptCount >= maxAttempts || waitedMs > MAX_RETRY_429_WAIT_MS) {
+        if (!isApiCall) {
+          throw httpError;
+        }
+        this.queueState.blockedUntil = until;
+        throw new RateLimitedError(until);
+      }
+
+      attemptCount += 1;
       await this.sleep(retryAfterMs);
     }
-
-    const data = await response.json();
-    queueItem.resolve({
-      data,
-      status: response.status,
-      statusText: response.statusText,
-    });
-  }
-
-  private requeue(queueItem: QueueItem<any>) {
-    if (queueItem.config.priority === "high") {
-      this.queueState.highPriorityQueue.unshift(queueItem);
-      return;
-    }
-    this.queueState.normalPriorityQueue.unshift(queueItem);
   }
 
   private enqueue(queueItem: QueueItem<any>) {
