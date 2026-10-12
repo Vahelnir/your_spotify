@@ -17,6 +17,7 @@ export interface BaseImporterState {
   current: number;
   total: number;
   status: ImporterStateStatus;
+  rateLimitedUntil?: string | null;
 }
 
 export interface PrivacyImporterState extends BaseImporterState {

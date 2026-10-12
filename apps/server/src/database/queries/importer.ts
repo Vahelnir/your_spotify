@@ -18,7 +18,8 @@ export const createImporterState = (
 export const setImporterStateStatus = (
   id: string,
   status: ImporterStateStatus,
-) => ImporterStateModel.findByIdAndUpdate(id, { status });
+  rateLimitedUntil: Date | null = null,
+) => ImporterStateModel.findByIdAndUpdate(id, { status, rateLimitedUntil });
 
 export const getImporterState = <T extends ImporterStateType>(id: string) =>
   ImporterStateModel.findById<ImporterStateFromType<T>>(id);
