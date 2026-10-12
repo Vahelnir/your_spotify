@@ -15,6 +15,7 @@ import {
   getTracksAlbumsArtists,
   storeTrackAlbumArtist,
 } from "../../spotify/dbTools";
+import { isTransientError } from "../apis/queueHttpClient";
 import { SpotifyAPI } from "../apis/spotifyApi";
 import { logger } from "../logger";
 import {
@@ -60,8 +61,9 @@ export class PrivacyImporter implements HistoryImporter<"privacy"> {
   search = async (track: string, artist: string) => {
     const res = await retryPromise(
       () => this.spotifyApi.search(track, artist),
-      10,
+      3,
       30,
+      isTransientError,
     );
     return res;
   };

@@ -15,6 +15,7 @@ import {
   getTracksAlbumsArtists,
   storeTrackAlbumArtist,
 } from "../../spotify/dbTools";
+import { isTransientError } from "../apis/queueHttpClient";
 import { SpotifyAPI } from "../apis/spotifyApi";
 import { logger } from "../logger";
 import { minOfArray, retryPromise } from "../misc";
@@ -63,6 +64,7 @@ export class FullPrivacyImporter implements HistoryImporter<"full-privacy"> {
       () => this.spotifyApi.getTracks(spotifyIds),
       10,
       30,
+      isTransientError,
     );
     return res;
   };

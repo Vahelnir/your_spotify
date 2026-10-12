@@ -112,12 +112,15 @@ export class SpotifyAPI {
   }
 
   async getTrack(id: string) {
+    const client = await this.checkToken();
     try {
-      const client = await this.checkToken();
       const res = await client.get(`/tracks/${id}`);
       return res.data as SpotifyTrack;
-    } catch {
-      return undefined;
+    } catch (e) {
+      if (e instanceof HttpError && (e.status === 400 || e.status === 404)) {
+        return undefined;
+      }
+      throw e;
     }
   }
 
@@ -131,11 +134,14 @@ export class SpotifyAPI {
   }
 
   async getAlbum(id: string) {
+    const client = await this.checkToken();
     try {
-      const client = await this.checkToken();
       const res = await client.get(`/albums/${id}`);
       return res.data as SpotifyAlbum;
-    } catch {
+    } catch (e) {
+      if (e instanceof HttpError && e.status === 429) {
+        throw e;
+      }
       return undefined;
     }
   }
@@ -150,11 +156,14 @@ export class SpotifyAPI {
   }
 
   async getArtist(id: string) {
+    const client = await this.checkToken();
     try {
-      const client = await this.checkToken();
       const res = await client.get(`/artists/${id}`);
       return res.data as SpotifyArtist;
-    } catch {
+    } catch (e) {
+      if (e instanceof HttpError && e.status === 429) {
+        throw e;
+      }
       return undefined;
     }
   }
