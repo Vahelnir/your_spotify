@@ -95,9 +95,15 @@ export class FullPrivacyImporter implements HistoryImporter<"full-privacy"> {
   };
 
   storeItems = async (userId: string, items: RecentlyPlayedTrack[]) => {
-    const { tracks, albums, artists } = await getTracksAlbumsArtists(
-      userId,
-      items.map((it) => it.track),
+    const { tracks, albums, artists } = await retryPromise(
+      () =>
+        getTracksAlbumsArtists(
+          userId,
+          items.map((it) => it.track),
+        ),
+      3,
+      30,
+      isTransientError,
     );
     await storeTrackAlbumArtist({ tracks, albums, artists });
     const finalInfos: Omit<Infos, "owner">[] = [];
