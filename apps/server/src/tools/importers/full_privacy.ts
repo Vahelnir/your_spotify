@@ -218,6 +218,7 @@ export class FullPrivacyImporter implements HistoryImporter<"full-privacy"> {
       }
       if (!content.spotify_track_uri.startsWith("spotify:track:")) {
         logger.debug(`Not a track uri: ${content.spotify_track_uri}`);
+        continue;
       }
       const spotifyId = FullPrivacyImporter.idFromSpotifyURI(
         content.spotify_track_uri,

@@ -9,7 +9,6 @@ interface HttpClientRequestConfig {
   params?: Record<string, string>;
   headers?: Record<string, string>;
   priority?: RequestPriority;
-  retry429MaxAttempts?: number;
 }
 
 interface HttpClientResponse<T> {
@@ -59,7 +58,6 @@ export class RateLimitedError extends HttpError {
 export const isTransientError = (error: unknown) =>
   !(error instanceof HttpError && error.status < 500);
 
-const DEFAULT_RETRY_429_MAX_ATTEMPTS = 5;
 const DEFAULT_RETRY_AFTER_MS = 1000;
 const MAX_RETRY_429_WAIT_MS = 60_000;
 
@@ -190,9 +188,6 @@ export class QueuedHttpClient {
 
     // Only calls to the factory's API are rate limited, not the auth domain
     const isApiCall = queueItem.config.url.startsWith(this.baseURL);
-    const maxAttempts =
-      queueItem.config.retry429MaxAttempts ?? DEFAULT_RETRY_429_MAX_ATTEMPTS;
-    let attemptCount = 0;
     let waitedMs = 0;
 
     while (true) {
@@ -225,13 +220,22 @@ export class QueuedHttpClient {
       }
 
       const retryAfterMs = this.parseRetryAfterHeader(response);
-      const until = new Date(Date.now() + retryAfterMs);
+      // At least 1s per retry, so Retry-After: 0 still uses up the budget
+      const waitMs = Math.max(retryAfterMs, DEFAULT_RETRY_AFTER_MS);
+      waitedMs += waitMs;
+      const budgetExceeded = waitedMs > MAX_RETRY_429_WAIT_MS;
+      // Once the budget is spent, back off for at least as long as the budget
+      const until = new Date(
+        Date.now() +
+          (budgetExceeded
+            ? Math.max(retryAfterMs, MAX_RETRY_429_WAIT_MS)
+            : waitMs),
+      );
       logger.warn(
         `Rate limited on ${url.origin}, Retry-After: ${retryAfterMs / 1000}s, until ${until.toISOString()}`,
       );
 
-      waitedMs += retryAfterMs;
-      if (attemptCount >= maxAttempts || waitedMs > MAX_RETRY_429_WAIT_MS) {
+      if (budgetExceeded) {
         if (!isApiCall) {
           throw httpError;
         }
@@ -239,8 +243,7 @@ export class QueuedHttpClient {
         throw new RateLimitedError(until);
       }
 
-      attemptCount += 1;
-      await this.sleep(retryAfterMs);
+      await this.sleep(waitMs);
     }
   }
 
