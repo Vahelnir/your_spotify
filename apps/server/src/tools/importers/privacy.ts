@@ -15,6 +15,7 @@ import {
   getTracksAlbumsArtists,
   storeTrackAlbumArtist,
 } from "../../spotify/dbTools";
+import { isTransientError } from "../apis/queueHttpClient";
 import { SpotifyAPI } from "../apis/spotifyApi";
 import { logger } from "../logger";
 import {
@@ -60,16 +61,23 @@ export class PrivacyImporter implements HistoryImporter<"privacy"> {
   search = async (track: string, artist: string) => {
     const res = await retryPromise(
       () => this.spotifyApi.search(track, artist),
-      10,
+      3,
       30,
+      isTransientError,
     );
     return res;
   };
 
   storeItems = async (userId: string, items: RecentlyPlayedTrack[]) => {
-    const { tracks, albums, artists } = await getTracksAlbumsArtists(
-      userId,
-      items.map((it) => it.track),
+    const { tracks, albums, artists } = await retryPromise(
+      () =>
+        getTracksAlbumsArtists(
+          userId,
+          items.map((it) => it.track),
+        ),
+      3,
+      30,
+      isTransientError,
     );
     await storeTrackAlbumArtist({ tracks, albums, artists });
     const finalInfos: Omit<Infos, "owner">[] = [];
@@ -104,8 +112,8 @@ export class PrivacyImporter implements HistoryImporter<"privacy"> {
         durationMs: item.track.duration_ms,
       });
     }
-    await setImporterStateCurrent(this.id, this.currentItem + 1);
     await addTrackIdsToUser(this.userId.toString(), finalInfos);
+    await setImporterStateCurrent(this.id, this.currentItem + 1);
     const min = minOfArray(finalInfos, (info) => info.played_at.getTime());
     if (min) {
       const minInfo = finalInfos[min.minIndex];

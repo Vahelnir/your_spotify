@@ -277,6 +277,7 @@ export const retryPromise = async <T>(
   fn: () => Promise<T>,
   max: number,
   timeSeconds: number,
+  shouldRetry: (error: unknown) => boolean = () => true,
 ): Promise<T> => {
   if (max <= 0) {
     throw new Error("Cannot retry 0 times");
@@ -289,6 +290,9 @@ export const retryPromise = async <T>(
       const res = await fn();
       return res;
     } catch (e) {
+      if (!shouldRetry(e)) {
+        throw e;
+      }
       lastError = e;
       logger.error(
         `Retrying crashed promise, ${i + 1}/${max}${

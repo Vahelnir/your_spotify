@@ -14,6 +14,7 @@ export const ImporterStateSchema = new Schema<ImporterState>(
       enum: ["progress", "success", "failure", "failure-removed"],
       default: "progress",
     },
+    rateLimitedUntil: Date,
   },
   { timestamps: true },
 );

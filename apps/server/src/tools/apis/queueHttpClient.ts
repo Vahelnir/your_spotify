@@ -1,3 +1,5 @@
+import { logger } from "../logger";
+
 export type RequestPriority = "normal" | "high";
 
 interface HttpClientRequestConfig {
@@ -7,7 +9,6 @@ interface HttpClientRequestConfig {
   params?: Record<string, string>;
   headers?: Record<string, string>;
   priority?: RequestPriority;
-  retry429MaxAttempts?: number;
 }
 
 interface HttpClientResponse<T> {
@@ -20,13 +21,15 @@ interface QueueItem<T = any> {
   config: HttpClientRequestConfig;
   resolve: (value: HttpClientResponse<T>) => void;
   reject: (reason?: unknown) => void;
-  retry429AttemptCount: number;
 }
 
 interface QueueState {
   highPriorityQueue: QueueItem<any>[];
   normalPriorityQueue: QueueItem<any>[];
   isProcessingQueue: boolean;
+  blockedUntil?: Date;
+  minApiIntervalMs: number;
+  lastApiFetchAt: number;
 }
 
 export class HttpError extends Error {
@@ -44,26 +47,45 @@ export class HttpError extends Error {
   }
 }
 
-const DEFAULT_RETRY_429_MAX_ATTEMPTS = 5;
-const DEFAULT_RETRY_AFTER_MS = 1000;
+export class RateLimitedError extends HttpError {
+  constructor(public readonly until: Date) {
+    super({
+      status: 429,
+      statusText: "Too Many Requests",
+      body: `Rate limited until ${until.toISOString()}`,
+    });
+  }
+}
 
-function createQueueState(): QueueState {
+export const isTransientError = (error: unknown) =>
+  !(error instanceof HttpError && error.status < 500);
+
+const MIN_RETRY_429_WAIT_MS = 1000;
+const MAX_RETRY_429_WAIT_MS = 60_000;
+
+function createQueueState(minApiIntervalMs = 0): QueueState {
   return {
     highPriorityQueue: [],
     normalPriorityQueue: [],
     isProcessingQueue: false,
+    minApiIntervalMs,
+    lastApiFetchAt: 0,
   };
 }
 
 export class QueuedHttpClientFactory {
-  private readonly queueState: QueueState = createQueueState();
+  private readonly queueState: QueueState;
 
   constructor(
     private readonly options: {
       baseURL: string;
       headers: Record<string, string>;
+      // Minimum time between the starts of two API calls
+      minApiIntervalMs?: number;
     },
-  ) {}
+  ) {
+    this.queueState = createQueueState(options.minApiIntervalMs);
+  }
 
   createClient(headers: Record<string, string>) {
     const mergedHeaders = { ...this.options.headers, ...headers };
@@ -96,7 +118,6 @@ export class QueuedHttpClient {
         },
         resolve,
         reject,
-        retry429AttemptCount: 0,
       };
 
       this.enqueue(queueItem);
@@ -173,51 +194,86 @@ export class QueuedHttpClient {
       credentials: "include",
     };
 
-    const response = await fetch(url, payload);
+    // Only calls to the factory's API are rate limited, not the auth domain
+    const isApiCall = queueItem.config.url.startsWith(this.baseURL);
+    let waitedMs = 0;
 
-    if (!response.ok) {
+    while (true) {
+      const { blockedUntil } = this.queueState;
+      if (isApiCall && blockedUntil && blockedUntil.getTime() > Date.now()) {
+        throw new RateLimitedError(blockedUntil);
+      }
+
+      if (isApiCall) {
+        const { lastApiFetchAt, minApiIntervalMs } = this.queueState;
+        const intervalWaitMs = lastApiFetchAt + minApiIntervalMs - Date.now();
+        if (intervalWaitMs > 0) {
+          await this.sleep(intervalWaitMs);
+        }
+        this.queueState.lastApiFetchAt = Date.now();
+      }
+
+      const response = await fetch(url, payload);
+
+      if (response.ok) {
+        const data = await response.json();
+        queueItem.resolve({
+          data,
+          status: response.status,
+          statusText: response.statusText,
+        });
+        return;
+      }
+
       const text = await response.text();
+      const httpError = new HttpError({
+        status: response.status,
+        statusText: response.statusText,
+        body: text,
+      });
 
       if (response.status !== 429) {
-        throw new HttpError({
-          status: response.status,
-          statusText: response.statusText,
-          body: text,
-        });
+        throw httpError;
       }
-
-      const maxAttempts =
-        queueItem.config.retry429MaxAttempts ?? DEFAULT_RETRY_429_MAX_ATTEMPTS;
-
-      if (queueItem.retry429AttemptCount >= maxAttempts) {
-        throw new HttpError({
-          status: response.status,
-          statusText: response.statusText,
-          body: text,
-        });
-      }
-
-      queueItem.retry429AttemptCount += 1;
-      this.requeue(queueItem);
 
       const retryAfterMs = this.parseRetryAfterHeader(response);
-      await this.sleep(retryAfterMs);
-    }
+      if (retryAfterMs === undefined) {
+        // Without a usable Retry-After, back off right away instead of guessing
+        if (!isApiCall) {
+          throw httpError;
+        }
+        const until = new Date(Date.now() + MAX_RETRY_429_WAIT_MS);
+        logger.warn(
+          `Rate limited on ${url.origin} without Retry-After, until ${until.toISOString()}`,
+        );
+        this.queueState.blockedUntil = until;
+        throw new RateLimitedError(until);
+      }
+      // At least 1s per retry, so Retry-After: 0 still uses up the budget
+      const waitMs = Math.max(retryAfterMs, MIN_RETRY_429_WAIT_MS);
+      waitedMs += waitMs;
+      const budgetExceeded = waitedMs > MAX_RETRY_429_WAIT_MS;
+      // Once the budget is spent, back off for at least as long as the budget
+      const until = new Date(
+        Date.now() +
+          (budgetExceeded
+            ? Math.max(retryAfterMs, MAX_RETRY_429_WAIT_MS)
+            : waitMs),
+      );
+      logger.warn(
+        `Rate limited on ${url.origin}, Retry-After: ${retryAfterMs / 1000}s, until ${until.toISOString()}`,
+      );
 
-    const data = await response.json();
-    queueItem.resolve({
-      data,
-      status: response.status,
-      statusText: response.statusText,
-    });
-  }
+      if (budgetExceeded) {
+        if (!isApiCall) {
+          throw httpError;
+        }
+        this.queueState.blockedUntil = until;
+        throw new RateLimitedError(until);
+      }
 
-  private requeue(queueItem: QueueItem<any>) {
-    if (queueItem.config.priority === "high") {
-      this.queueState.highPriorityQueue.unshift(queueItem);
-      return;
+      await this.sleep(waitMs);
     }
-    this.queueState.normalPriorityQueue.unshift(queueItem);
   }
 
   private enqueue(queueItem: QueueItem<any>) {
@@ -239,7 +295,7 @@ export class QueuedHttpClient {
   private parseRetryAfterHeader(response: Response) {
     const retryAfter = response.headers.get("retry-after");
     if (!retryAfter) {
-      return DEFAULT_RETRY_AFTER_MS;
+      return undefined;
     }
 
     const retryAfterValue = Array.isArray(retryAfter)
@@ -253,7 +309,7 @@ export class QueuedHttpClient {
 
     const retryAtTimestamp = Date.parse(retryAfterValue);
     if (Number.isNaN(retryAtTimestamp)) {
-      return DEFAULT_RETRY_AFTER_MS;
+      return undefined;
     }
 
     return Math.max(0, retryAtTimestamp - Date.now());
