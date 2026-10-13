@@ -111,17 +111,22 @@ export class SpotifyAPI {
     return this.handleAddIdsToPlaylist(data.id, ids);
   }
 
-  async getTrack(id: string) {
+  // 400 and 404 mean the item does not exist, anything else is a real failure
+  private async getItem<T>(url: string) {
     const client = await this.checkToken();
     try {
-      const res = await client.get(`/tracks/${id}`);
-      return res.data as SpotifyTrack;
+      const res = await client.get(url);
+      return res.data as T;
     } catch (e) {
       if (e instanceof HttpError && (e.status === 400 || e.status === 404)) {
         return undefined;
       }
       throw e;
     }
+  }
+
+  getTrack(id: string) {
+    return this.getItem<SpotifyTrack>(`/tracks/${id}`);
   }
 
   async getTracks(spotifyIds: string[]) {
@@ -133,17 +138,8 @@ export class SpotifyAPI {
     return tracks;
   }
 
-  async getAlbum(id: string) {
-    const client = await this.checkToken();
-    try {
-      const res = await client.get(`/albums/${id}`);
-      return res.data as SpotifyAlbum;
-    } catch (e) {
-      if (e instanceof HttpError && e.status === 429) {
-        throw e;
-      }
-      return undefined;
-    }
+  getAlbum(id: string) {
+    return this.getItem<SpotifyAlbum>(`/albums/${id}`);
   }
 
   async getAlbums(spotifyIds: string[]) {
@@ -155,17 +151,8 @@ export class SpotifyAPI {
     return albums;
   }
 
-  async getArtist(id: string) {
-    const client = await this.checkToken();
-    try {
-      const res = await client.get(`/artists/${id}`);
-      return res.data as SpotifyArtist;
-    } catch (e) {
-      if (e instanceof HttpError && e.status === 429) {
-        throw e;
-      }
-      return undefined;
-    }
+  getArtist(id: string) {
+    return this.getItem<SpotifyArtist>(`/artists/${id}`);
   }
 
   async getArtists(spotifyIds: string[]) {

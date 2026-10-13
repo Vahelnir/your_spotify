@@ -28,6 +28,8 @@ interface QueueState {
   normalPriorityQueue: QueueItem<any>[];
   isProcessingQueue: boolean;
   blockedUntil?: Date;
+  minApiIntervalMs: number;
+  lastApiFetchAt: number;
 }
 
 export class HttpError extends Error {
@@ -58,26 +60,32 @@ export class RateLimitedError extends HttpError {
 export const isTransientError = (error: unknown) =>
   !(error instanceof HttpError && error.status < 500);
 
-const DEFAULT_RETRY_AFTER_MS = 1000;
+const MIN_RETRY_429_WAIT_MS = 1000;
 const MAX_RETRY_429_WAIT_MS = 60_000;
 
-function createQueueState(): QueueState {
+function createQueueState(minApiIntervalMs = 0): QueueState {
   return {
     highPriorityQueue: [],
     normalPriorityQueue: [],
     isProcessingQueue: false,
+    minApiIntervalMs,
+    lastApiFetchAt: 0,
   };
 }
 
 export class QueuedHttpClientFactory {
-  private readonly queueState: QueueState = createQueueState();
+  private readonly queueState: QueueState;
 
   constructor(
     private readonly options: {
       baseURL: string;
       headers: Record<string, string>;
+      // Minimum time between the starts of two API calls
+      minApiIntervalMs?: number;
     },
-  ) {}
+  ) {
+    this.queueState = createQueueState(options.minApiIntervalMs);
+  }
 
   createClient(headers: Record<string, string>) {
     const mergedHeaders = { ...this.options.headers, ...headers };
@@ -196,6 +204,15 @@ export class QueuedHttpClient {
         throw new RateLimitedError(blockedUntil);
       }
 
+      if (isApiCall) {
+        const { lastApiFetchAt, minApiIntervalMs } = this.queueState;
+        const intervalWaitMs = lastApiFetchAt + minApiIntervalMs - Date.now();
+        if (intervalWaitMs > 0) {
+          await this.sleep(intervalWaitMs);
+        }
+        this.queueState.lastApiFetchAt = Date.now();
+      }
+
       const response = await fetch(url, payload);
 
       if (response.ok) {
@@ -220,8 +237,20 @@ export class QueuedHttpClient {
       }
 
       const retryAfterMs = this.parseRetryAfterHeader(response);
+      if (retryAfterMs === undefined) {
+        // Without a usable Retry-After, back off right away instead of guessing
+        if (!isApiCall) {
+          throw httpError;
+        }
+        const until = new Date(Date.now() + MAX_RETRY_429_WAIT_MS);
+        logger.warn(
+          `Rate limited on ${url.origin} without Retry-After, until ${until.toISOString()}`,
+        );
+        this.queueState.blockedUntil = until;
+        throw new RateLimitedError(until);
+      }
       // At least 1s per retry, so Retry-After: 0 still uses up the budget
-      const waitMs = Math.max(retryAfterMs, DEFAULT_RETRY_AFTER_MS);
+      const waitMs = Math.max(retryAfterMs, MIN_RETRY_429_WAIT_MS);
       waitedMs += waitMs;
       const budgetExceeded = waitedMs > MAX_RETRY_429_WAIT_MS;
       // Once the budget is spent, back off for at least as long as the budget
@@ -266,7 +295,7 @@ export class QueuedHttpClient {
   private parseRetryAfterHeader(response: Response) {
     const retryAfter = response.headers.get("retry-after");
     if (!retryAfter) {
-      return DEFAULT_RETRY_AFTER_MS;
+      return undefined;
     }
 
     const retryAfterValue = Array.isArray(retryAfter)
@@ -280,7 +309,7 @@ export class QueuedHttpClient {
 
     const retryAtTimestamp = Date.parse(retryAfterValue);
     if (Number.isNaN(retryAtTimestamp)) {
-      return DEFAULT_RETRY_AFTER_MS;
+      return undefined;
     }
 
     return Math.max(0, retryAtTimestamp - Date.now());

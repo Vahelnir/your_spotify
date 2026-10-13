@@ -5,6 +5,10 @@ import { toBoolean, toNumber } from "./zod";
 const validators = {
   CLIENT_ENDPOINT: z.string(),
   MAX_IMPORT_CACHE_SIZE: z.preprocess(toNumber, z.number().optional()),
+  SPOTIFY_MIN_REQUEST_INTERVAL_MS: z.preprocess(
+    toNumber,
+    z.number().optional(),
+  ),
   CORS: z.string().optional(),
   MONGO_ENDPOINT: z.string().optional(),
   SPOTIFY_PUBLIC: z.string(),

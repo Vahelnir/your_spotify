@@ -59,7 +59,9 @@ export default function ImportHistory() {
             <div className={s.right}>
               <Text size="normal">
                 {statusToString[st.status]} ({st.current}/{st.total})
-                {st.status === "failure" && st.rateLimitedUntil
+                {st.status === "failure" &&
+                st.rateLimitedUntil &&
+                new Date(st.rateLimitedUntil).getTime() > Date.now()
                   ? ` - rate limited until ${DateFormatter.toMinuteHourDayMonthYear(new Date(st.rateLimitedUntil))}`
                   : null}
               </Text>
